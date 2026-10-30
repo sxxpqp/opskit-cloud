@@ -1,0 +1,39 @@
+# Go 代理服务，只需要修改前四项即可启动。
+listen: ":8080"                       # 服务监听端口
+public_url: "http://127.0.0.1:8080"     # 客户端访问地址，填写云服务器 IP 或域名
+allow_cidrs: ["127.0.0.1/32"]          # 允许访问的客户端公网出口 IP/网段
+timeout: "15m"                        # 单次下载最长时间
+
+# 可选：直接由 Go 提供 HTTPS；证书文件在服务器上准备。
+tls_cert: ""
+tls_key: ""
+
+# 左侧是访问路径，右侧是上游。一般不用修改。
+downloads:
+  github: https://github.com/
+  raw: https://raw.githubusercontent.com/
+  kubernetes: https://dl.k8s.io/release/
+  golang: https://go.dev/dl/
+  docker-ce: https://download.docker.com/
+  go: https://proxy.golang.org/
+  npm: https://registry.npmjs.org/
+  pip: https://pypi.org/
+  pip-files: https://files.pythonhosted.org/
+  maven: https://repo.maven.apache.org/maven2/
+
+# 容器镜像：上游地址和允许代理的认证服务器。
+registries:
+  dockerhub:
+    upstream: https://registry-1.docker.io
+    auth_hosts: [auth.docker.io]
+  k8s:
+    upstream: https://registry.k8s.io
+  ghcr:
+    upstream: https://ghcr.io
+  quay:
+    upstream: https://quay.io
+  # aliyun:
+  #   upstream: https://registry.cn-hangzhou.aliyuncs.com
+  #   auth_hosts: [dockerauth.cn-hangzhou.aliyuncs.com]
+  oracle:
+    upstream: https://container-registry.oracle.com

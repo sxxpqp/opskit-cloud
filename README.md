@@ -1,126 +1,110 @@
 # opskit-cloud
 
-为 [sxxpqp/opskit](https://github.com/sxxpqp/opskit) 配置中的下载源与软件仓库提供云端缓存代理。
-采用 Nexus Repository + Caddy HTTPS。缓存首次请求仍需访问上游，不保证突破上游限流或访问权限。
+一个 Go 编写的下载与镜像转发服务。客户端 → Go 服务 → 上游。
+不依赖 Nexus、Caddy、Docker，也不提供本地磁盘缓存。
 
-## 覆盖范围
+## 1. 配置放在哪里
 
-| 内容 | Nexus 仓库或域名 |
+复制 config.example.yaml 为 config.yaml，先修改：
+
+```yaml
+listen: ":8080"                         # 云服务器监听端口
+public_url: "http://你的服务器IP:8080"   # 客户端能访问的地址
+allow_cidrs: ["你的公网出口IP/32"]       # 哪些客户端可以使用
+timeout: "15m"                          # 单次下载最长时间
+```
+
+downloads 是下载源，registries 是镜像源。配置文件有完整默认值和中文注释。
+不填写任意开放网段；代理只接受白名单客户端的 GET/HEAD，不允许上传。
+使用请求连接的真实来源 IP 判断，不信任客户端自行发送的 X-Forwarded-For。
+若另加负载均衡，应在网络层限制入口，不能把共享负载均衡 IP 当成所有用户的鉴权。
+/healthz 不检查白名单，只表示进程能响应，不能证明上游可达。
+
+## 2. 启动
+
+```sh
+go build -o opskit-cloud .
+./opskit-cloud init --output config.yaml
+# 编辑 config.yaml 后启动
+./opskit-cloud serve --config config.yaml
+```
+
+也可以通过参数生成配置：
+
+```sh
+./opskit-cloud init \
+  --public-url https://cache.example.com \
+  --allow-cidrs '203.0.113.10/32,198.51.100.0/24' \
+  --upstream github=https://github.com/ \
+  --output config.yaml
+```
+
+init 拒绝覆盖已有文件。serve 支持 --listen、--public-url 临时覆盖，以及 --check 只校验。
+直接由 Go 提供 HTTPS 时，在 YAML 填 tls_cert、tls_key；证书文件需运行账号可读。
+CI 默认部署 HTTP :8080。公网生产使用应配置可信 TLS，避免将私有仓库凭据通过 HTTP 发送。
+只修改 public_url 不会自动启用 TLS；也不自动申请证书。
+
+## 3. 转发地址
+
+| 内容 | 入口路径 |
 |---|---|
-| GitHub Release、raw 文件、opskit 自身发布文件 | raw-github / raw-githubusercontent |
-| kubeadm / kubelet / kubectl 及摘要文件 | kubernetes-binaries |
-| Go SDK 和发布校验元数据 | golang |
-| Docker 安装包软件源 | docker-ce |
-| Go 模块 / npm / pip / Maven Central | go-proxy / npm-proxy / pypi-proxy / maven-public |
-| Docker Hub / registry.k8s.io / quay.io / ghcr.io | dockerhub / k8s / quay / ghcr 子域名 |
-| 模板中的阿里云与 Oracle 镜像 | aliyun / oracle 子域名 |
+| GitHub Release / raw 文件 | /github/ 与 /raw/ |
+| Kubernetes 二进制 | /kubernetes/ |
+| Go SDK / Docker 安装文件 | /golang/ 与 /docker-ce/ |
+| Go / npm / pip / Maven | /go/、/npm/、/pip/simple/、/maven/ |
+| Docker Hub 默认 API | /v2/ |
+| 按仓库选择镜像 API | /v2/dockerhub/、/v2/k8s/、/v2/ghcr/、/v2/quay/、/v2/aliyun/、/v2/oracle/ |
 
-安装文件通过 raw 缓存；容器镜像通过 Docker registry 代理。不会修改数据库、S3、SSH 等业务地址。
-私有镜像和受许可限制的 Oracle 镜像仍需合法的上游凭据；本项目不会绕过授权。
-Maven 当前覆盖 Central，不包含阿里云 public 聚合仓库中的全部额外制品。
-Go 校验数据库访问、系统 apt/yum 源和任意第三方 URL 不等同于这些配置源，未提供通用出口代理。
+例如访问 /github/sxxpqp/opskit/releases/...，由 Go 访问 github.com/sxxpqp/opskit/releases/... 后返回内容。
+上游 HTTPS 重定向在服务器端跟随，npm/pip 元数据中的已知上游绝对地址改写到代理入口。
+镜像 Bearer 认证地址在同上游或 auth_hosts 白名单内才允许转发；/auth/路径自动生成，无需手填。
+上游增加新的认证域名时，需明确加入对应 auth_hosts，不能盲目开放任意域名。
+客户端必须能使用与 public_url 一致的入口。容器镜像的 token、manifest、blob 仍需逐一上线实测。
 
-## 云服务器准备
-
-需要 Linux、Docker Engine + Compose、Python 3.9+，以及足够的内存和缓存磁盘。
-先确认云服务器能够访问上述上游；如果云服务器自身无法访问，缓存代理也无法下载。
-服务器的公网地址、域名、SSH 信息尚未配置，仓库本身不会自动连接任何服务器。
-
-1. 为主域名及 dockerhub、k8s、quay、ghcr、aliyun、oracle 六个子域名配置 DNS，全部指向云服务器。
-2. 安全组放行 80/443。8081 仅绑定本机，不对公网开放；Docker connector 端口不映射宿主机。
-3. 下载并校验 Release 包后解压到 /opt/opskit-cloud。首次可先克隆本仓库。
-4. 执行以下命令：
+## 4. 生成 opskit 配置
 
 ```sh
-cp .env.example .env
-# 编辑 .env：真实域名、ACME 邮箱、客户端公网出口 CIDR。
-# CLIENT_CIDRS 支持以空格分隔的多个网段；默认仅 loopback，因此外部客户端不能使用。
-# NEXUS_IMAGE、CADDY_IMAGE 应替换为经过验证的固定版本或 sha256 摘要。
-docker compose up -d
-docker compose logs -f nexus
-```
-
-Nexus 需要时间启动。看到启动成功后，读取首次管理员密码：
-
-```sh
-docker compose exec nexus cat /nexus-data/admin.password
-```
-
-通过 SSH 隧道访问管理界面，完成向导并修改初始密码：
-
-```sh
-ssh -L 8081:127.0.0.1:8081 user@your-cloud-server
-# 本机浏览器打开 http://127.0.0.1:8081
-```
-
-在向导中启用匿名只读下载；公网入口同时受 Caddy 的 CLIENT_CIDRS 限制。
-只在受控网络中使用，禁止将 CLIENT_CIDRS 配成任意公网访问。
-不要将管理员密码或 .env 提交到公开仓库。
-
-## 初始化全部缓存仓库
-
-在云服务器上执行，密码只通过环境变量提供：
-
-```sh
-read -rsp 'Nexus admin password: ' NEXUS_ADMIN_PASSWORD; echo
-export NEXUS_ADMIN_PASSWORD
-python3 scripts/bootstrap.py
-unset NEXUS_ADMIN_PASSWORD
-```
-
-脚本使用本机 8081 管理 API，创建缺失仓库，并启用 Docker Bearer Token Realm。
-重复执行保留已有同名仓库，不自动覆盖现有配置。
-Nexus 各版本 REST 模型可能不同，API 报错时须检查对应版本内置 API 文档，不应忽略错误。
-所有缓存持久化在 nexus-data 卷；升级前备份，禁止 docker compose down -v。
-
-## 生成 opskit 配置
-
-本地已有 opskit 完整配置时：
-
-```sh
-python3 -m pip install PyYAML==6.0.2
-python3 scripts/render_config.py /path/to/opskit/config.yaml \
-  --domain cache.example.com --output config.generated.yaml
+./opskit-cloud render --config config.yaml \
+  --input /path/to/opskit/config.yaml --output config.generated.yaml
 opskit doctor --config config.generated.yaml --profile local --output json
-opskit k8s download --config config.generated.yaml --dry-run
 ```
 
-输入文件保持不变，输出路径已存在时拒绝覆盖。生成器仅替换 install、kubeblocks 的已知下载地址及 mirrors；
-保留 SHA-256、组件版本、业务地址和其他字段值，输出 YAML 不保留注释。
-HTTPS 启用证书校验，containerd 使用独立 registry 域名，不再跳过证书检查。
-业务容器 image 字符串保持不变，containerd 通过 registry 映射代理。
-Docker registry-mirrors 只能透明加速 Docker Hub；其他 registry 若使用 Docker Engine，
-需要在镜像引用中显式替换 registry 为对应代理子域名，或使用经验证的其他代理机制。
+保留组件版本、校验摘要、SSH、数据库和 S3 字段值，改写已知安装下载源与 mirrors。输出不保留注释。
+containerd 使用 /v2/<仓库> 端点并设置 override_path=true，HTTPS 不跳过证书校验。
+Docker daemon 的 registry-mirrors 仅覆盖 Docker Hub，其他源应使用 containerd 映射或额外的域名入口。
+HTTP 入口需另行配置客户端运行时允许该 HTTP registry；工具不会自动关闭 TLS 校验。
+Maven 默认只有 Central；Go sumdb、OS apt/yum 和未知第三方 URL 不包含在默认代理范围。
+不会绕过私有镜像权限、上游访问限制和限流；云服务器必须能访问上游。
 
-## 验收
+## 5. GitHub 自动构建与部署
 
-先从 CLIENT_CIDRS 允许的客户端执行：
+Settings → Environments → production，配置：
+
+| 类型 | 名称 | 内容 |
+|---|---|---|
+| Variable | CLOUD_HOST | 云服务器 IP/主机名 |
+| Variable | CLOUD_USER | root 或能免密 sudo 的 SSH 用户 |
+| Variable | CLOUD_PORT | SSH 端口，默认 22 |
+| Variable | CLOUD_ARCH | amd64 或 arm64，默认 amd64 |
+| Variable | PROXY_PUBLIC_URL | 客户端访问地址，如 http://你的IP:8080 |
+| Variable | PROXY_ALLOW_CIDRS | 客户端公网 CIDR，多个用英文逗号分隔 |
+| Secret | CLOUD_PASSWORD | SSH 密码 |
+| Secret | CLOUD_KNOWN_HOSTS | 经可信渠道核对的 SSH known_hosts 记录 |
+
+密码不放明文 Variables。SSH 校验主机指纹，不在 CI 中盲信 ssh-keyscan。
+服务器只需要 Linux + systemd、bash、tar、curl，不需要 Docker、Go 或 Python。
+安全组放行受控来源的 SSH 和 8080。服务安装到 /opt/opskit-cloud，systemd 以动态非特权用户运行。
+PR 自动测试、race、vet 和构建；main 自动部署；v* tag 自动发布二进制和示例配置。
+部署前校验配置，失败尝试恢复上一版程序和配置。首次失败保留日志，使用 journalctl -u opskit-cloud 排查。
+CI 默认按 GitHub 参数重新生成配置并覆盖云端 config.yaml；不要只在服务器手改配置，否则下次部署会被覆盖。
+更多上游修改当前通过 config.example.yaml 或 init --upstream 实现；CI 参数化监听端口和 TLS 尚未接入，默认固定 HTTP 8080。
+实际服务器信息尚未配置，因此尚未完成线上部署及各上游的真实连通验收。
+
+## 验证
 
 ```sh
-curl -fI https://cache.example.com/repository/raw-githubusercontent/sxxpqp/opskit/main/README.md
-curl -i https://dockerhub.cache.example.com/v2/
+go test ./...
+go vet ./...
+./opskit-cloud serve --config config.example.yaml --check
+curl http://127.0.0.1:8080/healthz
 ```
-
-Docker /v2/ 可能返回正常的 401 Bearer challenge，不应返回网关 403 或 502。
-然后用小镜像实际拉取，再选一个 opskit 组件下载，并核对其原 SHA-256。
-同一文件重复下载后在 Nexus 中核对缓存命中。
-必须逐一验证目标 registry 的 token、重定向和 blob 下载；配置校验不代替真实拉取测试。
-
-## 自动构建和发版
-
-main 推送、PR 和手动运行自动执行单元测试、Compose/Caddy 配置校验并构建配置包。
-推送 v* 标签，在校验成功后自动发布 GitHub Release，附 tar.gz 和 SHA-256 清单。
-
-```sh
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-这是配置项目，发布的是可部署配置包，不重复构建 Nexus/Caddy 的官方镜像。
-当前未连接云服务器，自动部署尚未启用。补充 SSH 地址、用户、域名、部署路径后再接入部署任务；
-私钥与 known_hosts 应存 GitHub Secrets，配置不得明文提交。
-
-## 上游说明
-
-- [Nexus Docker reverse proxy](https://help.sonatype.com/en/docker-repository-reverse-proxy-strategies.html)
-- [Nexus Docker registry](https://help.sonatype.com/en/docker-registry.html)

@@ -1,0 +1,111 @@
+name: Build release and deploy
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: opskit-cloud-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go run . serve --config config.example.yaml --check
+      - name: Build Linux releases
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/opskit-cloud-linux-$arch" .
+          done
+          cp scripts/deploy.sh config.example.yaml dist/
+          cd dist
+          sha256sum opskit-cloud-linux-* deploy.sh config.example.yaml > checksums.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opskit-cloud
+          path: dist/*
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: opskit-cloud
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: opskit-cloud-production
+      cancel-in-progress: false
+    env:
+      CLOUD_HOST: ${{ vars.CLOUD_HOST }}
+      CLOUD_USER: ${{ vars.CLOUD_USER }}
+      CLOUD_PORT: ${{ vars.CLOUD_PORT || '22' }}
+      CLOUD_ARCH: ${{ vars.CLOUD_ARCH || 'amd64' }}
+      PROXY_PUBLIC_URL: ${{ vars.PROXY_PUBLIC_URL }}
+      PROXY_ALLOW_CIDRS: ${{ vars.PROXY_ALLOW_CIDRS }}
+      SSHPASS: ${{ secrets.CLOUD_PASSWORD }}
+      SSH_KNOWN_HOSTS: ${{ secrets.CLOUD_KNOWN_HOSTS }}
+    steps:
+      - name: Require deployment settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in CLOUD_HOST CLOUD_USER PROXY_PUBLIC_URL PROXY_ALLOW_CIDRS SSHPASS SSH_KNOWN_HOSTS; do
+            [[ -n "${!name}" ]] || { echo "Missing production setting: $name" >&2; exit 1; }
+          done
+          [[ "$CLOUD_HOST" =~ ^[a-zA-Z0-9.-]+$ ]]
+          [[ "$CLOUD_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]]
+          [[ "$CLOUD_PORT" =~ ^[0-9]+$ ]]
+          [[ "$CLOUD_ARCH" == amd64 || "$CLOUD_ARCH" == arm64 ]]
+      - uses: actions/download-artifact@v4
+        with:
+          name: opskit-cloud
+          path: dist
+      - name: Prepare configuration and SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          (cd dist && sha256sum --check checksums.txt)
+          # The runner is amd64; it generates configuration even for an arm64 server.
+          chmod +x dist/opskit-cloud-linux-amd64
+          mkdir staging
+          dist/opskit-cloud-linux-amd64 init --public-url "$PROXY_PUBLIC_URL" --allow-cidrs "$PROXY_ALLOW_CIDRS" --output staging/config.yaml
+          cp "dist/opskit-cloud-linux-$CLOUD_ARCH" staging/opskit-cloud
+          cp dist/deploy.sh staging/
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          tar -czf payload.tar.gz -C staging .
+      - name: Deploy over password-authenticated SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_stage="/tmp/opskit-cloud-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sshpass -e ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -p "$CLOUD_PORT" "$CLOUD_USER@$CLOUD_HOST" "umask 077; mkdir '$remote_stage'"
+          sshpass -e scp -o StrictHostKeyChecking=yes -P "$CLOUD_PORT" payload.tar.gz "$CLOUD_USER@$CLOUD_HOST:$remote_stage/payload.tar.gz"
+          sshpass -e ssh -o StrictHostKeyChecking=yes -p "$CLOUD_PORT" "$CLOUD_USER@$CLOUD_HOST" "cd '$remote_stage'; tar -xzf payload.tar.gz; bash deploy.sh"

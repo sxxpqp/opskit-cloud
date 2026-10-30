@@ -1,0 +1,10 @@
+.env
+config.yaml
+config.generated.yaml
+.validation-deps/
+.verification/
+.opskit-source.yaml
+__pycache__/
+*.pyc
+bin/
+dist/
